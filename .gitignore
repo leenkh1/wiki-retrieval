@@ -1,0 +1,24 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.cache/
+Desktop/
+notebooks/
+Section B.zip
+.bash_history
+.bash_logout
+.bashrc
+.config/
+.dotnet/
+.emacs
+.gitconfig
+.profile
+.sparkmagic/
+.venv/
+.vscode/
+wget-hsts
+bin/
+tmp-git-lfs/
+.azureml/
+.wget-hsts
+tmp-gitlfs/
