@@ -1,14 +1,10 @@
-"""Query-time retrieval (timed portion includes query embedding).
+"""Query-time retrieval.
 
 Two-stage pipeline:
-  1. recall : MiniLM dense (chunk vectors, FAISS IndexFlatIP, max-pooled to page)
-              + hand-rolled BM25 -> union of the top FIRST_STAGE_K pages per signal.
-  2. rerank : a cross-encoder (ms-marco-MiniLM-L-6-v2) scores each
-              (query, page_text) pair jointly and orders the candidates.
+  1. recall : MiniLM dense chunk retrieval + BM25 page retrieval.
+  2. rerank : cross-encoder scores each (query, page_text) pair jointly.
 
-The first-stage embeddings are produced by MiniLM as required; the cross-encoder
-is an additional model used only for reranking (permitted for that component).
-The query-time half of BM25 (LexicalIndex) lives here; the build half is in index.py.
+This version restores the cross-encoder setup and uses max_length=384.
 """
 from __future__ import annotations
 
@@ -17,34 +13,25 @@ from pathlib import Path
 from typing import List, Optional, Set, Tuple
 
 import numpy as np
+from sentence_transformers import CrossEncoder
 
 from embed import embed_queries
 from index import LEXICAL_ARRAYS_NAME, LEXICAL_META_NAME, PAGE_TEXTS_NAME, load_index
 from utils import ARTIFACTS_DIR, K_EVAL, tokenize
 
-from sentence_transformers import CrossEncoder
-
-try:  # FAISS is the intended path; numpy is a safe fallback.
+try:
     import faiss
     _HAVE_FAISS = True
-except Exception:  # pragma: no cover
+except Exception:
     _HAVE_FAISS = False
 
-# First-stage recall: pull the top FIRST_STAGE_K pages from each signal (dense, bm25)
-# and rerank their union. Larger -> higher recall ceiling but slower reranking.
+
 FIRST_STAGE_K = 50
-# How many top chunks to pull from the dense index before max-pooling to pages.
 DENSE_CHUNK_POOL = 4000
 
-# Cross-encoder reranker (second stage).
 RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-RERANK_MAX_LENGTH = 256
+RERANK_MAX_LENGTH = 384
 RERANK_BATCH = 128
-
-# Kept for reference / ablations (the single-stage fusion path); unused by run().
-FUSION_METHOD = "minmax"
-RRF_K = 60
-ALPHA = 0.2
 
 _CACHE: Optional[dict] = None
 _CE: Optional[CrossEncoder] = None
@@ -57,14 +44,22 @@ def _get_cross_encoder() -> CrossEncoder:
     return _CE
 
 
-# --------------------------------------------------------------------------- #
-# Lexical (BM25) query-time index.
-# --------------------------------------------------------------------------- #
 class LexicalIndex:
-    """Loaded BM25 index. ``score`` returns one BM25 value per page."""
+    """Loaded BM25 index. score() returns one BM25 value per page."""
 
-    def __init__(self, indptr, csc_doc, csc_tf, idf, doc_len, page_ids,
-                 vocab, avgdl, k1, b):
+    def __init__(
+        self,
+        indptr,
+        csc_doc,
+        csc_tf,
+        idf,
+        doc_len,
+        page_ids,
+        vocab,
+        avgdl,
+        k1,
+        b,
+    ):
         self.indptr = indptr
         self.csc_doc = csc_doc
         self.csc_tf = csc_tf
@@ -72,50 +67,69 @@ class LexicalIndex:
         self.page_ids = page_ids
         self.vocab = vocab
         self.k1 = k1
-        self._len_norm = (1.0 - b + b * doc_len / max(avgdl, 1e-9)).astype(np.float32)
+        self._len_norm = (
+            1.0 - b + b * doc_len / max(avgdl, 1e-9)
+        ).astype(np.float32)
 
     @classmethod
     def load(cls, artifacts_dir: Path) -> "LexicalIndex":
         arr = np.load(artifacts_dir / LEXICAL_ARRAYS_NAME)
-        meta = json.loads((artifacts_dir / LEXICAL_META_NAME).read_text(encoding="utf-8"))
+        meta = json.loads(
+            (artifacts_dir / LEXICAL_META_NAME).read_text(encoding="utf-8")
+        )
         return cls(
-            arr["indptr"], arr["csc_doc"], arr["csc_tf"], arr["idf"],
-            arr["doc_len"], arr["page_ids"], meta["vocab"],
-            float(meta["avgdl"]), float(meta["k1"]), float(meta["b"]),
+            arr["indptr"],
+            arr["csc_doc"],
+            arr["csc_tf"],
+            arr["idf"],
+            arr["doc_len"],
+            arr["page_ids"],
+            meta["vocab"],
+            float(meta["avgdl"]),
+            float(meta["k1"]),
+            float(meta["b"]),
         )
 
     def score(self, query: str) -> np.ndarray:
         """BM25 score for every page against one query string."""
         scores = np.zeros(len(self.page_ids), dtype=np.float32)
         k1 = self.k1
+
         for tok in set(tokenize(query)):
             tid = self.vocab.get(tok)
             if tid is None:
                 continue
+
             start, end = int(self.indptr[tid]), int(self.indptr[tid + 1])
             docs = self.csc_doc[start:end]
             tf = self.csc_tf[start:end]
+
             denom = tf + k1 * self._len_norm[docs]
             scores[docs] += self.idf[tid] * (tf * (k1 + 1.0)) / denom
+
         return scores
 
 
-# --------------------------------------------------------------------------- #
-# Artifact loading (cached for repeated run() calls).
-# --------------------------------------------------------------------------- #
 def _load_artifacts(artifacts_dir: Optional[Path]) -> dict:
     global _CACHE
+
     if _CACHE is not None and artifacts_dir is None:
         return _CACHE
+
     root = artifacts_dir or ARTIFACTS_DIR
+
     vectors, chunk_page_ids = load_index(artifacts_dir)
     lexical = LexicalIndex.load(root)
 
     page_ids = lexical.page_ids
     pos = {int(pid): i for i, pid in enumerate(page_ids)}
-    chunk_pos = np.array([pos.get(int(p), -1) for p in chunk_page_ids], dtype=np.int64)
+    chunk_pos = np.array(
+        [pos.get(int(p), -1) for p in chunk_page_ids],
+        dtype=np.int64,
+    )
 
     vectors = np.ascontiguousarray(vectors.astype(np.float32))
+
     faiss_index = None
     if _HAVE_FAISS and vectors.size:
         faiss_index = faiss.IndexFlatIP(vectors.shape[1])
@@ -132,32 +146,43 @@ def _load_artifacts(artifacts_dir: Optional[Path]) -> dict:
         "n_pages": len(page_ids),
         "page_texts": page_texts,
     }
+
     if artifacts_dir is None:
         _CACHE = bundle
+
     return bundle
 
 
-# --------------------------------------------------------------------------- #
-# Dense scoring helpers.
-# --------------------------------------------------------------------------- #
-def _dense_chunk_scores(bundle: dict, query_vectors: np.ndarray, pool: int) -> Tuple[np.ndarray, np.ndarray]:
-    """Return (scores, chunk_indices) of shape (n_queries, pool)."""
+def _dense_chunk_scores(
+    bundle: dict,
+    query_vectors: np.ndarray,
+    pool: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return dense chunk scores and chunk indices."""
     if bundle["faiss_index"] is not None:
         return bundle["faiss_index"].search(query_vectors, pool)
+
     sims = query_vectors @ bundle["vectors"].T
     idx = np.argpartition(-sims, kth=pool - 1, axis=1)[:, :pool]
     row = np.arange(sims.shape[0])[:, None]
     order = np.argsort(-sims[row, idx], axis=1)
     idx = idx[row, order]
+
     return sims[row, idx], idx
 
 
-def _maxpool_to_pages(scores: np.ndarray, chunk_idx: np.ndarray,
-                      chunk_pos: np.ndarray, n_pages: int) -> np.ndarray:
-    """Reduce one query's top chunks to a per-page max score."""
+def _maxpool_to_pages(
+    scores: np.ndarray,
+    chunk_idx: np.ndarray,
+    chunk_pos: np.ndarray,
+    n_pages: int,
+) -> np.ndarray:
+    """Reduce one query's top chunk scores to per-page max score."""
     page_scores = np.zeros(n_pages, dtype=np.float32)
+
     positions = chunk_pos[chunk_idx]
     valid = positions >= 0
+
     np.maximum.at(page_scores, positions[valid], scores[valid])
     return page_scores
 
@@ -167,76 +192,71 @@ def _topk_positions(scores: np.ndarray, k: int) -> Set[int]:
     k = min(k, len(scores))
     if k <= 0:
         return set()
+
     idx = np.argpartition(-scores, kth=k - 1)[:k]
     return {int(x) for x in idx}
 
 
-def _minmax(x: np.ndarray) -> np.ndarray:
-    lo, hi = float(x.min()), float(x.max())
-    if hi <= lo:
-        return np.zeros_like(x)
-    return (x - lo) / (hi - lo)
-
-
-def _fuse(dense: np.ndarray, sparse: np.ndarray, alpha: float, method: str) -> np.ndarray:
-    """Single-stage fusion (kept for ablations; not used by the two-stage path)."""
-    if method == "minmax":
-        return alpha * _minmax(dense) + (1.0 - alpha) * _minmax(sparse)
-    fused = np.zeros(len(dense), dtype=np.float32)
-    d_mask, s_mask = dense > 0, sparse > 0
-    if d_mask.any():
-        rd = np.empty(len(dense), dtype=np.float64)
-        rd[np.argsort(-dense, kind="stable")] = np.arange(len(dense))
-        fused[d_mask] += alpha / (RRF_K + rd[d_mask] + 1.0)
-    if s_mask.any():
-        rs = np.empty(len(sparse), dtype=np.float64)
-        rs[np.argsort(-sparse, kind="stable")] = np.arange(len(sparse))
-        fused[s_mask] += (1.0 - alpha) / (RRF_K + rs[s_mask] + 1.0)
-    return fused
-
-
-# --------------------------------------------------------------------------- #
-# Public entry point (two-stage: recall then cross-encoder rerank).
-# --------------------------------------------------------------------------- #
 def search_batch(
     queries: List[str],
     *,
     top_k: int = K_EVAL,
     artifacts_dir: Optional[Path] = None,
 ) -> List[List[int]]:
-    """Return ranked page_id lists (best first) for each query."""
+    """Return ranked page_id lists for each query."""
     if not queries:
         return []
+
     bundle = _load_artifacts(artifacts_dir)
+
     page_ids = bundle["page_ids"]
     n_pages = bundle["n_pages"]
     lexical: LexicalIndex = bundle["lexical"]
     page_texts = bundle["page_texts"]
 
     query_vectors = embed_queries(queries)
+
     pool = min(DENSE_CHUNK_POOL, bundle["vectors"].shape[0]) if bundle["vectors"].size else 0
-    d_scores, d_idx = (_dense_chunk_scores(bundle, query_vectors, pool) if pool else (None, None))
+    d_scores, d_idx = (
+        _dense_chunk_scores(bundle, query_vectors, pool)
+        if pool else (None, None)
+    )
 
     cross_encoder = _get_cross_encoder()
+
     ranked: List[List[int]] = []
+
     for i, query in enumerate(queries):
         dense = (
             _maxpool_to_pages(d_scores[i], d_idx[i], bundle["chunk_pos"], n_pages)
             if pool else np.zeros(n_pages, dtype=np.float32)
         )
+
         sparse = lexical.score(query)
 
-        # Stage 1 (recall): union of the top pages from each signal.
-        candidates = list(_topk_positions(dense, FIRST_STAGE_K) | _topk_positions(sparse, FIRST_STAGE_K))
+        candidates = list(
+            _topk_positions(dense, FIRST_STAGE_K)
+            | _topk_positions(sparse, FIRST_STAGE_K)
+        )
+
         if not candidates:
             ranked.append([])
             continue
 
-        # Stage 2 (rerank): cross-encoder scores (query, page_text) jointly.
-        pairs = [(query, page_texts.get(str(int(page_ids[p])), "")) for p in candidates]
+        pairs = [
+            (query, page_texts.get(str(int(page_ids[p])), ""))
+            for p in candidates
+        ]
+
         scores = np.asarray(
-            cross_encoder.predict(pairs, batch_size=RERANK_BATCH, show_progress_bar=False)
+            cross_encoder.predict(
+                pairs,
+                batch_size=RERANK_BATCH,
+                show_progress_bar=False,
+            )
         )
+
         order = np.argsort(-scores)[:top_k]
         ranked.append([int(page_ids[candidates[j]]) for j in order])
+
     return ranked
