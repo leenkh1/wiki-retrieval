@@ -1,28 +1,28 @@
 """Query-time retrieval (timed portion includes query embedding).
 
-Hybrid retrieval:
-  1. dense  : MiniLM query embedding -> exact inner-product search over chunk
-              vectors (FAISS IndexFlatIP) -> max-pool chunk scores to pages.
-  2. lexical: BM25 score per page (exact-token signal).
-  3. fuse   : per-query min-max normalise each signal, then weighted sum.
+Two-stage pipeline:
+  1. recall : MiniLM dense (chunk vectors, FAISS IndexFlatIP, max-pooled to page)
+              + hand-rolled BM25 -> union of the top FIRST_STAGE_K pages per signal.
+  2. rerank : a cross-encoder (ms-marco-MiniLM-L-6-v2) scores each
+              (query, page_text) pair jointly and orders the candidates.
 
-Exact (flat) dense search is used deliberately: at this corpus scale it costs
-milliseconds and avoids the recall loss of approximate indexes.
-
-The query-time half of BM25 (LexicalIndex) lives here; the build half lives in
-index.py. They are split this way because no new module files may be added.
+The first-stage embeddings are produced by MiniLM as required; the cross-encoder
+is an additional model used only for reranking (permitted for that component).
+The query-time half of BM25 (LexicalIndex) lives here; the build half is in index.py.
 """
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Set, Tuple
 
 import numpy as np
 
 from embed import embed_queries
-from index import LEXICAL_ARRAYS_NAME, LEXICAL_META_NAME, load_index
+from index import LEXICAL_ARRAYS_NAME, LEXICAL_META_NAME, PAGE_TEXTS_NAME, load_index
 from utils import ARTIFACTS_DIR, K_EVAL, tokenize
+
+from sentence_transformers import CrossEncoder
 
 try:  # FAISS is the intended path; numpy is a safe fallback.
     import faiss
@@ -30,14 +30,31 @@ try:  # FAISS is the intended path; numpy is a safe fallback.
 except Exception:  # pragma: no cover
     _HAVE_FAISS = False
 
-# Weight on the dense signal in the fusion (lexical gets 1 - ALPHA).
-# Tune on the public set; ~0.5 is a balanced starting point.
-ALPHA = 0.5
+# First-stage recall: pull the top FIRST_STAGE_K pages from each signal (dense, bm25)
+# and rerank their union. Larger -> higher recall ceiling but slower reranking.
+FIRST_STAGE_K = 50
 # How many top chunks to pull from the dense index before max-pooling to pages.
-# Large enough that any page that could reach the top-10 has a chunk included.
-DENSE_CHUNK_POOL = 2000
+DENSE_CHUNK_POOL = 4000
+
+# Cross-encoder reranker (second stage).
+RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+RERANK_MAX_LENGTH = 256
+RERANK_BATCH = 128
+
+# Kept for reference / ablations (the single-stage fusion path); unused by run().
+FUSION_METHOD = "minmax"
+RRF_K = 60
+ALPHA = 0.2
 
 _CACHE: Optional[dict] = None
+_CE: Optional[CrossEncoder] = None
+
+
+def _get_cross_encoder() -> CrossEncoder:
+    global _CE
+    if _CE is None:
+        _CE = CrossEncoder(RERANK_MODEL, max_length=RERANK_MAX_LENGTH)
+    return _CE
 
 
 # --------------------------------------------------------------------------- #
@@ -55,7 +72,6 @@ class LexicalIndex:
         self.page_ids = page_ids
         self.vocab = vocab
         self.k1 = k1
-        # Precompute the length-normalisation term per document.
         self._len_norm = (1.0 - b + b * doc_len / max(avgdl, 1e-9)).astype(np.float32)
 
     @classmethod
@@ -105,6 +121,8 @@ def _load_artifacts(artifacts_dir: Optional[Path]) -> dict:
         faiss_index = faiss.IndexFlatIP(vectors.shape[1])
         faiss_index.add(vectors)
 
+    page_texts = json.loads((root / PAGE_TEXTS_NAME).read_text(encoding="utf-8"))
+
     bundle = {
         "vectors": vectors,
         "faiss_index": faiss_index,
@@ -112,6 +130,7 @@ def _load_artifacts(artifacts_dir: Optional[Path]) -> dict:
         "lexical": lexical,
         "page_ids": np.asarray(page_ids, dtype=np.int64),
         "n_pages": len(page_ids),
+        "page_texts": page_texts,
     }
     if artifacts_dir is None:
         _CACHE = bundle
@@ -124,7 +143,7 @@ def _load_artifacts(artifacts_dir: Optional[Path]) -> dict:
 def _dense_chunk_scores(bundle: dict, query_vectors: np.ndarray, pool: int) -> Tuple[np.ndarray, np.ndarray]:
     """Return (scores, chunk_indices) of shape (n_queries, pool)."""
     if bundle["faiss_index"] is not None:
-        return bundle["faiss_index"].search(query_vectors, pool)  # (D, I)
+        return bundle["faiss_index"].search(query_vectors, pool)
     sims = query_vectors @ bundle["vectors"].T
     idx = np.argpartition(-sims, kth=pool - 1, axis=1)[:, :pool]
     row = np.arange(sims.shape[0])[:, None]
@@ -143,6 +162,15 @@ def _maxpool_to_pages(scores: np.ndarray, chunk_idx: np.ndarray,
     return page_scores
 
 
+def _topk_positions(scores: np.ndarray, k: int) -> Set[int]:
+    """Page positions of the top-k scores."""
+    k = min(k, len(scores))
+    if k <= 0:
+        return set()
+    idx = np.argpartition(-scores, kth=k - 1)[:k]
+    return {int(x) for x in idx}
+
+
 def _minmax(x: np.ndarray) -> np.ndarray:
     lo, hi = float(x.min()), float(x.max())
     if hi <= lo:
@@ -150,15 +178,31 @@ def _minmax(x: np.ndarray) -> np.ndarray:
     return (x - lo) / (hi - lo)
 
 
+def _fuse(dense: np.ndarray, sparse: np.ndarray, alpha: float, method: str) -> np.ndarray:
+    """Single-stage fusion (kept for ablations; not used by the two-stage path)."""
+    if method == "minmax":
+        return alpha * _minmax(dense) + (1.0 - alpha) * _minmax(sparse)
+    fused = np.zeros(len(dense), dtype=np.float32)
+    d_mask, s_mask = dense > 0, sparse > 0
+    if d_mask.any():
+        rd = np.empty(len(dense), dtype=np.float64)
+        rd[np.argsort(-dense, kind="stable")] = np.arange(len(dense))
+        fused[d_mask] += alpha / (RRF_K + rd[d_mask] + 1.0)
+    if s_mask.any():
+        rs = np.empty(len(sparse), dtype=np.float64)
+        rs[np.argsort(-sparse, kind="stable")] = np.arange(len(sparse))
+        fused[s_mask] += (1.0 - alpha) / (RRF_K + rs[s_mask] + 1.0)
+    return fused
+
+
 # --------------------------------------------------------------------------- #
-# Public entry point.
+# Public entry point (two-stage: recall then cross-encoder rerank).
 # --------------------------------------------------------------------------- #
 def search_batch(
     queries: List[str],
     *,
     top_k: int = K_EVAL,
     artifacts_dir: Optional[Path] = None,
-    alpha: float = ALPHA,
 ) -> List[List[int]]:
     """Return ranked page_id lists (best first) for each query."""
     if not queries:
@@ -167,15 +211,13 @@ def search_batch(
     page_ids = bundle["page_ids"]
     n_pages = bundle["n_pages"]
     lexical: LexicalIndex = bundle["lexical"]
+    page_texts = bundle["page_texts"]
 
     query_vectors = embed_queries(queries)
     pool = min(DENSE_CHUNK_POOL, bundle["vectors"].shape[0]) if bundle["vectors"].size else 0
+    d_scores, d_idx = (_dense_chunk_scores(bundle, query_vectors, pool) if pool else (None, None))
 
-    if pool:
-        d_scores, d_idx = _dense_chunk_scores(bundle, query_vectors, pool)
-    else:
-        d_scores = d_idx = None
-
+    cross_encoder = _get_cross_encoder()
     ranked: List[List[int]] = []
     for i, query in enumerate(queries):
         dense = (
@@ -183,10 +225,18 @@ def search_batch(
             if pool else np.zeros(n_pages, dtype=np.float32)
         )
         sparse = lexical.score(query)
-        fused = alpha * _minmax(dense) + (1.0 - alpha) * _minmax(sparse)
 
-        k = min(top_k, n_pages)
-        top = np.argpartition(-fused, kth=k - 1)[:k]
-        top = top[np.argsort(-fused[top])]
-        ranked.append([int(page_ids[p]) for p in top])
+        # Stage 1 (recall): union of the top pages from each signal.
+        candidates = list(_topk_positions(dense, FIRST_STAGE_K) | _topk_positions(sparse, FIRST_STAGE_K))
+        if not candidates:
+            ranked.append([])
+            continue
+
+        # Stage 2 (rerank): cross-encoder scores (query, page_text) jointly.
+        pairs = [(query, page_texts.get(str(int(page_ids[p])), "")) for p in candidates]
+        scores = np.asarray(
+            cross_encoder.predict(pairs, batch_size=RERANK_BATCH, show_progress_bar=False)
+        )
+        order = np.argsort(-scores)[:top_k]
+        ranked.append([int(page_ids[candidates[j]]) for j in order])
     return ranked

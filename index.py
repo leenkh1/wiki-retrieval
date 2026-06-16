@@ -1,8 +1,9 @@
 """Offline index build and load (not timed at grading).
 
-Builds two artifacts that ``run()`` loads at query time:
+Builds three artifacts that ``run()`` loads at query time:
   * dense  : index_vectors.npy + index_meta.json  (chunk embeddings)
   * lexical: lexical_index.npz + lexical_meta.json (page-level BM25)
+  * texts  : page_texts.json                       (page_id -> text, for reranking)
 
 The BM25 (lexical) build lives here rather than in its own module because no
 new files may be added to the package. The query-time half of BM25 lives in
@@ -24,6 +25,10 @@ INDEX_VECTORS_NAME = "index_vectors.npy"
 INDEX_META_NAME = "index_meta.json"
 LEXICAL_ARRAYS_NAME = "lexical_index.npz"
 LEXICAL_META_NAME = "lexical_meta.json"
+PAGE_TEXTS_NAME = "page_texts.json"
+
+# Cap stored page text length; the cross-encoder truncates well below this.
+PAGE_TEXT_MAX_CHARS = 2000
 
 # BM25 hyper-parameters (saturation / length normalization).
 BM25_K1 = 1.5
@@ -109,29 +114,24 @@ def save_lexical(index: Dict, out_dir: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Full corpus build (dense + lexical) and dense load.
+# Full corpus build (dense + lexical + page texts) and dense load.
 # --------------------------------------------------------------------------- #
 def build_index(
     *,
     entries_dir: Optional[Path] = None,
     artifacts_dir: Optional[Path] = None,
 ) -> Tuple[np.ndarray, List[int]]:
-    """Embed the full corpus, build the BM25 index, and persist both.
+    """Embed the full corpus, build the BM25 index, persist texts, and save all.
 
     Returns (chunk_vectors, chunk_page_ids) where row i of the dense matrix
     corresponds to chunk_page_ids[i] (page ids repeat across their chunks).
     """
     out_dir = artifacts_dir or ensure_artifacts_dir()
     records = list(iter_entries(entries_dir))
-    print(f"Loaded {len(records)} pages.", flush=True)
 
     # --- dense (chunk-level) ------------------------------------------------
     chunks: List[Chunk] = chunk_corpus(records)
-    print(f"Created {len(chunks)} chunks/vectors to embed.", flush=True)
-
     vectors = embed_texts([c.text for c in chunks])
-    print("Finished embedding all chunks.", flush=True)
-
     chunk_page_ids = [c.page_id for c in chunks]
 
     np.save(out_dir / INDEX_VECTORS_NAME, vectors)
@@ -148,6 +148,12 @@ def build_index(
     page_texts = [entry_text(r) for r in records]
     page_ids = [int(r["page_id"]) for r in records]
     save_lexical(build_lexical(page_texts, page_ids), out_dir)
+
+    # --- page texts (for cross-encoder reranking) --------------------------
+    page_text_map = {
+        str(int(r["page_id"])): entry_text(r)[:PAGE_TEXT_MAX_CHARS] for r in records
+    }
+    (out_dir / PAGE_TEXTS_NAME).write_text(json.dumps(page_text_map), encoding="utf-8")
 
     return vectors, chunk_page_ids
 
