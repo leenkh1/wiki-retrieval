@@ -14,7 +14,7 @@ _model: SentenceTransformer | None = None
 def get_model() -> SentenceTransformer:
     global _model
     if _model is None:
-        _model = SentenceTransformer(EMBEDDING_MODEL_NAME, device="cuda")
+        _model = SentenceTransformer(EMBEDDING_MODEL_NAME)
     return _model
 
 
