@@ -36,20 +36,20 @@ The grader should not rebuild the index. The submitted repository already includ
 
 ```text
 .
-??? artifacts/
-??? data/
-??? scripts/
-?   ??? build_index.py
-?   ??? eval_public.py
-??? chunk.py
-??? embed.py
-??? eval.py
-??? index.py
-??? main.py
-??? retrieve.py
-??? utils.py
-??? requirements.txt
-??? README.md
+ artifacts/
+ data/
+ scripts/
+    build_index.py
+    eval_public.py
+ chunk.py
+ embed.py
+ eval.py
+ index.py
+ main.py
+ retrieve.py
+ utils.py
+ requirements.txt
+ README.md
 ```
 
 ## Setup
@@ -181,6 +181,6 @@ Each inner list contains ranked `page_id` values, with the most relevant page fi
 
 ## Video Presentation
 
-Presentation link: **ADD VIDEO LINK HERE BEFORE FINAL SUBMISSION**
+Presentation link: https://drive.google.com/file/d/10ZZ_nTdfRp4AdGAaKSG7s3CIwzoxlAcH/view?usp=sharing
 
 The video explains the full pipeline: chunking, embedding, indexing, retrieval, reranking, development process, and empirical results.
