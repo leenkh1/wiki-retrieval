@@ -1,17 +1,17 @@
 """Preprocessing and chunking for the dense index.
 
-Three chunking modes (lecture: fixed-size vs. content-aware), selectable via
-CHUNK_MODE so they can be compared empirically:
+Supports three chunking modes, selectable via CHUNK_MODE so they can be
+compared empirically:
 
   * "fixed"     - sliding word windows of CHUNK_WORDS with CHUNK_OVERLAP.
-  * "paragraph" - split on blank-line / newline boundaries (content-aware);
-                  over-long paragraphs fall back to fixed windows.
-  * "sentence"  - split each paragraph into sentences (finest granularity).
+  * "paragraph" - split on blank-line / newline boundaries; over-long
+                  paragraphs fall back to fixed windows.
+  * "sentence"  - split each paragraph into sentences.
 
-For this corpus the pages are lists of short, self-contained factual
-sentences, so a content-aware split embeds each fact on its own vector instead
-of blending ~10 facts into one 200-word window. The title is prepended to every
-chunk so each retrieval unit keeps its topical anchor.
+For this corpus, pages contain short factual sentences. Content-aware splitting
+keeps related facts in smaller retrieval units instead of blending many facts
+into one long 200-word window. The title is prepended to every chunk so each
+retrieval unit keeps its topical context.
 """
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
-CHUNK_MODE = "paragraph"   # "fixed" | "paragraph" | "sentence"
+CHUNK_MODE = "paragraph"   # Active strategy: "fixed" | "paragraph" | "sentence"
 CHUNK_WORDS = 200          # max words per chunk (cap in every mode)
 CHUNK_OVERLAP = 40         # used by the fixed-size mode / long-unit fallback
 
@@ -35,6 +35,7 @@ class Chunk:
 
 
 def _fixed_windows(words: List[str], size: int, overlap: int) -> List[str]:
+    """Split a word list into overlapping fixed-size windows."""
     if len(words) <= size:
         return [" ".join(words)] if words else []
     step = max(1, size - overlap)
@@ -55,6 +56,7 @@ def _cap(unit: str) -> List[str]:
 
 
 def _split_content(content: str, mode: str) -> List[str]:
+    """Split page content according to the selected chunking mode."""
     if mode == "fixed":
         return _fixed_windows(content.split(), CHUNK_WORDS, CHUNK_OVERLAP)
 
@@ -87,6 +89,7 @@ def chunk_entry(record: Dict[str, Any]) -> List[Chunk]:
 
 
 def chunk_corpus(records: List[Dict[str, Any]]) -> List[Chunk]:
+    """Chunk all corpus records into retrieval units used for indexing."""
     chunks: List[Chunk] = []
     for record in records:
         chunks.extend(chunk_entry(record))

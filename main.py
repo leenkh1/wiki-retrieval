@@ -1,7 +1,7 @@
 """
 Section B entry point.
 
-The autograder calls run(queries) once with all evaluation queries (batch of 50).
+The autograder calls run(queries) once with all evaluation queries.
 Query embedding + retrieval must complete within the time limit (GPU available).
 """
 from __future__ import annotations

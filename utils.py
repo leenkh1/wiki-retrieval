@@ -50,6 +50,7 @@ def normalize_page_id(value: Any) -> int:
 
 
 def load_public_queries(path: Path | None = None) -> List[Dict[str, Any]]:
+    """Load public evaluation queries and normalize their relevant page IDs."""
     path = path or PUBLIC_QUERIES_PATH
     rows = json.loads(path.read_text(encoding="utf-8"))
     for row in rows:
@@ -74,6 +75,7 @@ def iter_entries(entries_dir: Path | None = None) -> Iterator[Dict[str, Any]]:
 
 
 def entry_text(record: Dict[str, Any]) -> str:
+    """Return the title plus content text used for indexing and reranking."""
     title = record.get("title", "")
     content = record.get("content", "")
     if title:
@@ -82,5 +84,6 @@ def entry_text(record: Dict[str, Any]) -> str:
 
 
 def ensure_artifacts_dir() -> Path:
+    """Create artifacts/ if needed and return its path."""
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
     return ARTIFACTS_DIR

@@ -4,7 +4,7 @@ Two-stage pipeline:
   1. recall : MiniLM dense chunk retrieval + BM25 page retrieval.
   2. rerank : cross-encoder scores each (query, page_text) pair jointly.
 
-This version restores the cross-encoder setup and uses max_length=384.
+The cross-encoder reranker uses max_length=384 to balance context size and speed.
 """
 from __future__ import annotations
 
@@ -26,8 +26,8 @@ except Exception:
     _HAVE_FAISS = False
 
 
-FIRST_STAGE_K = 50
-DENSE_CHUNK_POOL = 4000
+FIRST_STAGE_K = 50        # Number of dense/BM25 candidates before reranking.
+DENSE_CHUNK_POOL = 4000  # Number of dense chunks considered per query.
 
 RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 RERANK_MAX_LENGTH = 384
@@ -38,6 +38,7 @@ _CE: Optional[CrossEncoder] = None
 
 
 def _get_cross_encoder() -> CrossEncoder:
+    """Load the cross-encoder reranker once and return the cached instance."""
     global _CE
     if _CE is None:
         _CE = CrossEncoder(RERANK_MODEL, max_length=RERANK_MAX_LENGTH)
@@ -60,6 +61,7 @@ class LexicalIndex:
         k1,
         b,
     ):
+        """Store BM25 arrays and precompute document length normalization."""
         self.indptr = indptr
         self.csc_doc = csc_doc
         self.csc_tf = csc_tf
@@ -73,6 +75,7 @@ class LexicalIndex:
 
     @classmethod
     def load(cls, artifacts_dir: Path) -> "LexicalIndex":
+        """Load the saved BM25 arrays and metadata from artifacts_dir."""
         arr = np.load(artifacts_dir / LEXICAL_ARRAYS_NAME)
         meta = json.loads(
             (artifacts_dir / LEXICAL_META_NAME).read_text(encoding="utf-8")
@@ -111,6 +114,7 @@ class LexicalIndex:
 
 
 def _load_artifacts(artifacts_dir: Optional[Path]) -> dict:
+    """Load dense, lexical, and page-text artifacts, caching the default bundle."""
     global _CACHE
 
     if _CACHE is not None and artifacts_dir is None:
